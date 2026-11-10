@@ -1,0 +1,253 @@
+import { memo, useEffect, useLayoutEffect, useRef, useState, type ReactNode } from "react";
+import { ArrowDown, ChevronRight, CircleAlert, Info } from "lucide-react";
+import { api } from "../lib/bridge";
+import { duration, plural, tokens, waitText } from "../lib/format";
+import { pickVerb } from "../lib/rebel";
+import { toast, useStore, type Chat } from "../lib/store";
+import type { Item } from "../lib/types";
+import { Mark } from "./Logo";
+import { Markdown } from "./Markdown";
+import { Plans, SignIn } from "./Plans";
+import { SkullLoader } from "./SkullLoader";
+import { ToolItem } from "./ToolItem";
+
+// Transcript keeps to the bottom while you are there, and stays put when
+// you have scrolled up to read.
+export function Transcript({ chat }: { chat: Chat }) {
+  const ref = useRef<HTMLDivElement>(null);
+  const stick = useRef(true);
+  const [away, setAway] = useState(false);
+
+  useEffect(() => {
+    stick.current = true;
+    setAway(false);
+    const el = ref.current;
+    if (el) el.scrollTop = el.scrollHeight;
+  }, [chat.id]);
+
+  // Content grows from streaming, tool output opening, code blocks
+  // closing; while you are at the bottom, stay there.
+  useLayoutEffect(() => {
+    const el = ref.current;
+    const column = el?.firstElementChild;
+    if (!el || !column) return;
+    const follow = () => {
+      if (stick.current) el.scrollTop = el.scrollHeight;
+    };
+    follow();
+    const ro = new ResizeObserver(follow);
+    ro.observe(column);
+    return () => ro.disconnect();
+  }, [chat.id]);
+
+  const onScroll = () => {
+    const el = ref.current!;
+    const near = el.scrollHeight - el.scrollTop - el.clientHeight < 80;
+    stick.current = near;
+    if (near === away) setAway(!near);
+  };
+
+  const last = chat.items[chat.items.length - 1];
+  const busy =
+    chat.running &&
+    !(last?.kind === "assistant" && last.streaming && last.text) &&
+    !(last?.kind === "tool" && (last.tool?.status === "running" || last.tool?.status === "approval"));
+
+  return (
+    <>
+      <div className="scroll" ref={ref} onScroll={onScroll}>
+        <div className="column">
+          {chat.items.map((it) => (
+            <div key={it.id} style={{ display: "contents" }}>
+              <ItemView item={it} chatId={chat.id} />
+              {chat.turns
+                .filter((t) => t.after === it.id)
+                .map((t, i) => (
+                  <div key={i} className="turn-stats">
+                    {[duration(t.stats.ms), t.stats.tools ? plural(t.stats.tools, "tool") : "", t.stats.tokens ? `${tokens(t.stats.tokens)} tokens` : ""]
+                      .filter(Boolean)
+                      .join(" · ")}
+                  </div>
+                ))}
+            </div>
+          ))}
+          {busy && <Working started={chat.started} />}
+        </div>
+      </div>
+      {away && (
+        <button
+          className="to-bottom"
+          title="Jump to the latest"
+          onClick={() => {
+            const el = ref.current!;
+            stick.current = true;
+            setAway(false);
+            el.scrollTo({ top: el.scrollHeight, behavior: "smooth" });
+          }}
+        >
+          <ArrowDown size={15} />
+        </button>
+      )}
+    </>
+  );
+}
+
+function ItemView({ item, chatId }: { item: Item; chatId: string }) {
+  switch (item.kind) {
+    case "user":
+      return (
+        <div className="user item">
+          <div className="user-bubble">{item.text}</div>
+        </div>
+      );
+    case "assistant":
+      return <Assistant item={item} />;
+    case "tool":
+      return <ToolItem item={item} chatId={chatId} />;
+    case "paywall":
+      return <Paywall item={item} />;
+    case "notice":
+      return (
+        <div className={`notice item${item.tone === "error" ? " error" : ""}`}>
+          {item.tone === "error" ? <CircleAlert size={14} /> : <Info size={14} />}
+          {item.action === "sign-in" ? (
+            <SignIn>{item.text}</SignIn>
+          ) : item.action === "retry" ? (
+            <TryAgain chatId={chatId}>{item.text}</TryAgain>
+          ) : item.until ? (
+            <Countdown reason={item.text ?? ""} until={item.until} />
+          ) : (
+            <span>{item.text}</span>
+          )}
+        </div>
+      );
+  }
+}
+
+// Countdown is a busy model being waited out: "Rate limited · retrying in
+// 23s". Stop ends the wait with the turn.
+function Countdown({ reason, until }: { reason: string; until: number }) {
+  const [now, setNow] = useState(Date.now);
+  useEffect(() => {
+    setNow(Date.now());
+    const t = window.setInterval(() => setNow(Date.now()), 1000);
+    return () => window.clearInterval(t);
+  }, [until]);
+  const left = until - now;
+  return (
+    <span role="status">
+      {reason} · {left < 1000 ? "retrying now…" : `retrying in ${waitText(left)}`}
+    </span>
+  );
+}
+
+// TryAgain is a turn that gave up waiting out a busy model, and the button
+// that takes it up again.
+function TryAgain({ chatId, children }: { chatId: string; children: ReactNode }) {
+  const [busy, setBusy] = useState(false);
+  const retry = () => {
+    setBusy(true);
+    api
+      .retry(chatId)
+      .catch(toast)
+      .finally(() => setBusy(false));
+  };
+  return (
+    <div className="notice-action">
+      <span className="grow">{children}</span>
+      <button className="btn" disabled={busy} onClick={retry}>
+        Try again
+      </button>
+    </div>
+  );
+}
+
+const Assistant = memo(function Assistant({ item }: { item: Item }) {
+  const thinking = Boolean(item.streaming && !item.text);
+  return (
+    <div className="assistant item">
+      {item.reasoning && <Thinking text={item.reasoning} live={thinking} />}
+      {item.text && <Markdown text={item.text} />}
+    </div>
+  );
+});
+
+function Thinking({ text, live }: { text: string; live: boolean }) {
+  const [open, setOpen] = useState(false);
+  return (
+    <div className="thinking">
+      <button className="thinking-toggle" onClick={() => setOpen(!open)}>
+        <ChevronRight size={13} className={`tool-chev${open ? " open" : ""}`} />
+        <span className={live ? "shimmer" : ""}>{live ? "Thinking" : "Thought"}</span>
+      </button>
+      {open && <div className="thinking-body">{text.trim()}</div>}
+    </div>
+  );
+}
+
+// Working is the terminal client's status line, in the window: the skull
+// in dots for its spinner, a rebel verb for this stretch of work, and how
+// long the turn has run. Each stretch (the model thinking, or going back
+// to work on a tool's result) mounts it afresh, with a new verb.
+function Working({ started }: { started?: number }) {
+  const [verb] = useState(pickVerb);
+  const [, tick] = useState(0);
+  useEffect(() => {
+    const t = window.setInterval(() => tick((n) => n + 1), 1000);
+    return () => window.clearInterval(t);
+  }, []);
+  const ms = started ? Math.max(1000, Date.now() - started) : 0;
+  return (
+    <div className="working" aria-label="Working">
+      <SkullLoader />
+      <span className="shimmer">{verb}…</span>
+      {ms > 0 && <span className="working-time">{duration(Math.floor(ms / 1000) * 1000)}</span>}
+    </div>
+  );
+}
+
+// Paywall holds the messages above it until the account runs them:
+// signed out, until there is one; on a plan without the model, until
+// there is a plan with it.
+function Paywall({ item }: { item: Item }) {
+  const plans = useStore((s) => s.plans);
+  const account = useStore((s) => s.account);
+  const smallest = plans.find((p) => p.large)?.name ?? "a paid plan";
+  if (!account?.signedIn) {
+    return (
+      <div className="paywall item">
+        <div className="paywall-head">
+          <Mark size={26} />
+          <div>
+            <div className="paywall-title">Join the resistance</div>
+            <div className="paywall-sub">
+              {account?.expired ? "Your sign-in ran out. " : ""}
+              caveira runs on an account. Sign in and your message goes through.
+            </div>
+          </div>
+        </div>
+        <div className="paywall-sign-in">
+          <SignIn primary>Free to start, with Qwen3.5. A plan adds GLM.</SignIn>
+        </div>
+      </div>
+    );
+  }
+  return (
+    <div className="paywall item">
+      <div className="paywall-head">
+        <Mark size={26} />
+        <div>
+          <div className="paywall-title">
+            {item.text ? `${item.text} fights in a heavier class` : "Join the resistance"}
+          </div>
+          <div className="paywall-sub">
+            {item.text
+              ? `It comes with ${smallest} and up. Pick a plan and your message goes through, or switch models below.`
+              : "caveira runs on a plan. Pick one and your message goes through."}
+          </div>
+        </div>
+      </div>
+      <Plans locked={item.text || undefined} held />
+    </div>
+  );
+}

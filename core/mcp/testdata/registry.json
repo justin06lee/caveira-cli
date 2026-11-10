@@ -1,0 +1,342 @@
+{
+ "servers": [
+  {
+   "server": {
+    "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+    "name": "io.github.Evozim/dockerfile-credential-mcp",
+    "description": "Premium agentic endpoint for dockerfile-credential-mcp.",
+    "title": "Execute dockerfile-credential-mcp",
+    "version": "2.0.0",
+    "remotes": [
+     {
+      "type": "sse",
+      "url": "https://api.m2mcent.com/dockerfile-credential-mcp/sse",
+      "headers": [
+       {
+        "description": "Base64-encoded EIP-3009 TransferWithAuthorization signature for x402 V2 settlement on Base Mainnet ($0.08 USDC).",
+        "isSecret": true,
+        "name": "Payment-Signature"
+       }
+      ]
+     }
+    ]
+   },
+   "_meta": {
+    "io.modelcontextprotocol.registry/official": {
+     "status": "active",
+     "statusChangedAt": "2026-08-17T21:59:42.43073Z",
+     "publishedAt": "2026-08-17T21:59:42.43073Z",
+     "updatedAt": "2026-08-17T21:59:42.43073Z",
+     "isLatest": true
+    }
+   }
+  },
+  {
+   "server": {
+    "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+    "name": "io.github.GavinLucas/docker-mcp-server",
+    "description": "Manage Docker (containers, images, Compose, Swarm, registries) via the Docker SDK and CLI.",
+    "title": "Docker MCP Server",
+    "repository": {
+     "url": "https://github.com/GavinLucas/docker-mcp",
+     "source": "github"
+    },
+    "version": "2.1.1",
+    "packages": [
+     {
+      "registryType": "pypi",
+      "identifier": "docker-mcp-server",
+      "version": "2.1.1",
+      "transport": {
+       "type": "stdio"
+      }
+     },
+     {
+      "registryType": "oci",
+      "identifier": "ghcr.io/gavinlucas/docker-mcp-server:2.1.1",
+      "transport": {
+       "type": "stdio"
+      }
+     },
+     {
+      "registryType": "mcpb",
+      "identifier": "https://github.com/GavinLucas/docker-mcp/releases/download/v2.1.1/docker-mcp-server-2.1.1.mcpb",
+      "fileSha256": "26d3f6134e602d5edd54a1ad92b5f2618ee7b0e60c1d70c75f98050898854010",
+      "transport": {
+       "type": "stdio"
+      }
+     }
+    ]
+   },
+   "_meta": {
+    "io.modelcontextprotocol.registry/official": {
+     "status": "deprecated",
+     "statusChangedAt": "2026-07-15T21:14:22.957806Z",
+     "statusMessage": "Moved to io.github.L337-org/docker-mcp-server",
+     "publishedAt": "2026-07-08T09:28:35.874389Z",
+     "updatedAt": "2026-07-15T21:14:22.957806Z",
+     "isLatest": true
+    }
+   }
+  },
+  {
+   "server": {
+    "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+    "name": "io.github.artemdruzhininad-star/docker-wts-build",
+    "description": "Schedule Docker builds via Windows Task Scheduler \u2014 survives VS Code terminal timeouts",
+    "version": "0.1.2",
+    "packages": [
+     {
+      "registryType": "pypi",
+      "identifier": "docker-wts-build",
+      "version": "0.1.2",
+      "transport": {
+       "type": "stdio"
+      },
+      "environmentVariables": [
+       {
+        "description": "Path to project directory containing docker-compose.yml",
+        "isRequired": true,
+        "format": "string",
+        "name": "DWTB_PROJECT_DIR"
+       },
+       {
+        "description": "Docker Compose file name (default: docker-compose.yml)",
+        "format": "string",
+        "name": "DWTB_COMPOSE_FILE"
+       },
+       {
+        "description": "Semicolon-separated list of custom service names",
+        "format": "string",
+        "name": "DWTB_CUSTOM_SERVICES"
+       },
+       {
+        "description": "Directory for build logs (default: {project_dir}/builds/logs)",
+        "format": "string",
+        "name": "DWTB_LOGS_DIR"
+       },
+       {
+        "description": "Task name prefix for Windows Task Scheduler (default: DockerBuild)",
+        "format": "string",
+        "name": "DWTB_TASK_PREFIX"
+       },
+       {
+        "description": "Task timeout in milliseconds (default: 28800000 = 8 hours)",
+        "format": "string",
+        "name": "DWTB_TASK_TIMEOUT_MS"
+       },
+       {
+        "description": "Maximum age in days for cleanup (default: 30)",
+        "format": "string",
+        "name": "DWTB_MAX_TASK_AGE_DAYS"
+       }
+      ]
+     }
+    ]
+   },
+   "_meta": {
+    "io.modelcontextprotocol.registry/official": {
+     "status": "active",
+     "statusChangedAt": "2026-04-27T21:34:53.210083Z",
+     "publishedAt": "2026-04-27T21:34:53.210083Z",
+     "updatedAt": "2026-04-27T21:34:53.210083Z",
+     "isLatest": true
+    }
+   }
+  },
+  {
+   "server": {
+    "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+    "name": "io.github.hypnosis/docker-mcp-server",
+    "description": "Docker for AI agents \u2014 containers, compose stacks, logs and databases, locally or over SSH.",
+    "title": "Docker MCP Server",
+    "repository": {
+     "url": "https://github.com/hypnosis/docker-mcp-server",
+     "source": "github"
+    },
+    "version": "2.0.1",
+    "websiteUrl": "https://github.com/hypnosis/docker-mcp-server#readme",
+    "packages": [
+     {
+      "registryType": "npm",
+      "identifier": "@hypnosis/docker-mcp-server",
+      "version": "2.0.1",
+      "runtimeHint": "npx",
+      "transport": {
+       "type": "stdio"
+      },
+      "environmentVariables": [
+       {
+        "description": "Absolute path to the JSON file describing the Docker hosts this agent may reach. Without it the server answers about the Docker on this machine.",
+        "format": "filepath",
+        "name": "DOCKER_MCP_PROFILES_FILE"
+       },
+       {
+        "description": "The same profiles JSON inline, used when no profiles file is set.",
+        "format": "string",
+        "name": "DOCKER_PROFILES"
+       },
+       {
+        "description": "Keep going when a profile's SSH key is missing, instead of refusing the profile. Defaults to false.",
+        "format": "boolean",
+        "name": "DOCKER_MCP_ALLOW_SSH_FALLBACK"
+       },
+       {
+        "description": "Log verbosity: error, warn, info or debug. Defaults to info.",
+        "format": "string",
+        "name": "LOG_LEVEL"
+       }
+      ]
+     }
+    ]
+   },
+   "_meta": {
+    "io.modelcontextprotocol.registry/official": {
+     "status": "active",
+     "statusChangedAt": "2026-08-24T20:36:22.290843Z",
+     "publishedAt": "2026-08-24T20:36:22.290843Z",
+     "updatedAt": "2026-08-24T20:36:22.290843Z",
+     "isLatest": true
+    }
+   }
+  },
+  {
+   "server": {
+    "$schema": "https://static.modelcontextprotocol.io/schemas/2025-09-29/server.schema.json",
+    "name": "ai.smithery/smithery-ai-github",
+    "description": "Access the GitHub API, enabling file operations, repository management, search functionality, and\u2026",
+    "repository": {
+     "url": "https://github.com/smithery-ai/mcp-servers",
+     "source": "github",
+     "subfolder": "github"
+    },
+    "version": "1.0.0",
+    "remotes": [
+     {
+      "type": "streamable-http",
+      "url": "https://server.smithery.ai/@smithery-ai/github/mcp",
+      "headers": [
+       {
+        "description": "Bearer token for Smithery authentication",
+        "isRequired": true,
+        "value": "Bearer {smithery_api_key}",
+        "isSecret": true,
+        "name": "Authorization"
+       }
+      ]
+     }
+    ]
+   },
+   "_meta": {
+    "io.modelcontextprotocol.registry/official": {
+     "status": "active",
+     "statusChangedAt": "2025-09-10T18:22:12.930528Z",
+     "publishedAt": "2025-09-10T18:22:12.930528Z",
+     "updatedAt": "2025-09-10T18:22:12.930528Z",
+     "isLatest": true
+    }
+   }
+  },
+  {
+   "server": {
+    "$schema": "https://static.modelcontextprotocol.io/schemas/2025-09-29/server.schema.json",
+    "name": "io.github.bytedance/mcp-server-filesystem",
+    "description": "MCP server for filesystem access",
+    "repository": {
+     "url": "https://github.com/bytedance/UI-TARS-desktop",
+     "source": "github",
+     "subfolder": "packages/agent-infra/mcp-servers/filesystem"
+    },
+    "version": "1.0.0",
+    "packages": [
+     {
+      "registryType": "npm",
+      "registryBaseUrl": "https://registry.npmjs.org",
+      "identifier": "@agent-infra/mcp-server-filesystem",
+      "version": "latest",
+      "transport": {
+       "type": "stdio"
+      },
+      "packageArguments": [
+       {
+        "description": "Comma-separated list of allowed directories for file operations",
+        "isRequired": true,
+        "format": "string",
+        "type": "named",
+        "name": "allowed-directories"
+       }
+      ]
+     },
+     {
+      "registryType": "npm",
+      "registryBaseUrl": "https://registry.npmjs.org",
+      "identifier": "@agent-infra/mcp-server-filesystem",
+      "version": "latest",
+      "runtimeHint": "npx",
+      "transport": {
+       "type": "sse",
+       "url": "http://127.0.0.1:{port}/sse"
+      },
+      "packageArguments": [
+       {
+        "description": "Comma-separated list of allowed directories for file operations",
+        "isRequired": true,
+        "format": "string",
+        "type": "named",
+        "name": "allowed-directories"
+       },
+       {
+        "description": "Server port number",
+        "isRequired": true,
+        "format": "number",
+        "default": "8089",
+        "type": "named",
+        "name": "port"
+       }
+      ]
+     },
+     {
+      "registryType": "npm",
+      "registryBaseUrl": "https://registry.npmjs.org",
+      "identifier": "@agent-infra/mcp-server-filesystem",
+      "version": "latest",
+      "runtimeHint": "npx",
+      "transport": {
+       "type": "streamable-http",
+       "url": "http://127.0.0.1:{port}/mcp"
+      },
+      "packageArguments": [
+       {
+        "description": "Comma-separated list of allowed directories for file operations",
+        "isRequired": true,
+        "format": "string",
+        "type": "named",
+        "name": "allowed-directories"
+       },
+       {
+        "description": "Server port number",
+        "isRequired": true,
+        "format": "number",
+        "default": "8089",
+        "type": "named",
+        "name": "port"
+       }
+      ]
+     }
+    ]
+   },
+   "_meta": {
+    "io.modelcontextprotocol.registry/official": {
+     "status": "active",
+     "statusChangedAt": "2025-09-09T06:16:36.369748Z",
+     "publishedAt": "2025-09-09T06:16:36.369748Z",
+     "updatedAt": "2025-09-09T06:16:36.369748Z",
+     "isLatest": true
+    }
+   }
+  }
+ ],
+ "metadata": {
+  "count": 6
+ }
+}

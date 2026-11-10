@@ -1,0 +1,92 @@
+// Small formatters for the quiet numbers around the edges.
+
+export function ago(iso: string, now = Date.now()): string {
+  const t = Date.parse(iso);
+  if (Number.isNaN(t)) return "";
+  const s = Math.max(0, (now - t) / 1000);
+  if (s < 60) return "now";
+  if (s < 3600) return `${Math.floor(s / 60)}m`;
+  if (s < 86400) return `${Math.floor(s / 3600)}h`;
+  if (s < 7 * 86400) return `${Math.floor(s / 86400)}d`;
+  return new Date(t).toLocaleDateString(undefined, { month: "short", day: "numeric" });
+}
+
+export function duration(ms: number): string {
+  const s = ms / 1000;
+  if (s < 1) return "<1s";
+  if (s < 60) return `${Math.round(s)}s`;
+  const m = Math.floor(s / 60);
+  return `${m}m ${Math.round(s - m * 60)}s`;
+}
+
+// waitText is a wait as the app says it: 23s, 2m, 1m 30s.
+export function waitText(ms: number): string {
+  const s = Math.ceil(ms / 1000);
+  if (s < 60) return `${s}s`;
+  if (s % 60 === 0) return `${s / 60}m`;
+  return `${Math.floor(s / 60)}m ${s % 60}s`;
+}
+
+// usedPercent rounds the share of usage spent to a whole percent, and
+// never says 100 before it is.
+export function usedPercent(used: number): number {
+  if (used >= 1) return 100;
+  return Math.min(99, Math.round(Math.max(0, used) * 100));
+}
+
+// usageTone is how the usage bar reads: amber past 80%, red once it is
+// all used.
+export function usageTone(used: number): "" | "high" | "full" {
+  if (used >= 1) return "full";
+  if (used > 0.8) return "high";
+  return "";
+}
+
+export function tokens(n: number): string {
+  if (n < 1000) return `${n}`;
+  if (n < 1_000_000) return `${Math.round(n / 1000)}k`;
+  return `${(n / 1_000_000).toFixed(1).replace(/\.0$/, "")}M`;
+}
+
+// resets says when usage starts again: the time within a day, the date
+// after that. Usage resets on the 1st in UTC, so the date is UTC's, the
+// day the site names too.
+export function resets(iso: string, now = Date.now()): string {
+  const t = Date.parse(iso);
+  if (Number.isNaN(t)) return "";
+  const d = new Date(t);
+  if (t - now < 86400_000) return `resets at ${d.toLocaleTimeString(undefined, { hour: "numeric", minute: "2-digit" })}`;
+  return `resets ${d.toLocaleDateString(undefined, { month: "short", day: "numeric", timeZone: "UTC" })}`;
+}
+
+export function plural(n: number, word: string): string {
+  return `${n} ${word}${n === 1 ? "" : "s"}`;
+}
+
+// diffStat counts added and removed lines in a unified diff.
+export function diffStat(diff: string): { add: number; del: number } {
+  let add = 0;
+  let del = 0;
+  for (const l of diff.split("\n")) {
+    if (l.startsWith("+") && !l.startsWith("+++")) add++;
+    else if (l.startsWith("-") && !l.startsWith("---")) del++;
+  }
+  return { add, del };
+}
+
+// effortName is how a reasoning level reads on screen; "" leaves it to
+// the model.
+export function effortName(e: string): string {
+  return effortNames[e] ?? e;
+}
+
+const effortNames: Record<string, string> = {
+  "": "Default",
+  none: "None",
+  minimal: "Minimal",
+  low: "Low",
+  medium: "Medium",
+  high: "High",
+  xhigh: "Extra high",
+  max: "Max",
+};

@@ -1,0 +1,946 @@
+package main
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"log"
+	"net/http"
+	"os"
+	"strings"
+	"time"
+
+	"github.com/justin06lee/caveira/core/agent"
+	"github.com/justin06lee/caveira/core/config"
+	"github.com/justin06lee/caveira/core/importer"
+	"github.com/justin06lee/caveira/core/llm"
+	"github.com/justin06lee/caveira/core/mcp"
+	"github.com/justin06lee/caveira/core/prompt"
+	"github.com/justin06lee/caveira/core/skills"
+)
+
+// Item is one entry in a transcript as the window draws it.
+type Item struct {
+	ID   string `json:"id"`
+	Kind string `json:"kind"` // user, assistant, tool, notice, paywall
+	// Text is the message, or on a paywall the model the plan lacks, ""
+	// when the paywall is a sign-in.
+	Text string `json:"text,omitempty"`
+	// Reasoning is the model's thinking before an assistant reply.
+	Reasoning string    `json:"reasoning,omitempty"`
+	Streaming bool      `json:"streaming,omitempty"`
+	Tool      *ToolView `json:"tool,omitempty"`
+	// Tone colours a notice: "info" or "error".
+	Tone string `json:"tone,omitempty"`
+	// Action is what a notice offers to do about itself: "sign-in", or
+	// "retry" a turn that gave up waiting out a busy model.
+	Action string `json:"action,omitempty"`
+	// Until, on the notice of a busy model being waited out, is when the
+	// request goes again, in Unix milliseconds: the window counts down.
+	Until int64 `json:"until,omitempty"`
+}
+
+// ToolView is one tool call.
+type ToolView struct {
+	// Call is the model's ID for the call, which approvals answer to.
+	Call    string `json:"call"`
+	Name    string `json:"name"`
+	Label   string `json:"label"` // Read, Edit, Run…
+	Preview string `json:"preview"`
+	Kind    string `json:"kind"`   // read, write, execute
+	Status  string `json:"status"` // running, approval, done, error
+	// Always, during an approval, is what Always allow covers when it is
+	// more than this tool: "the github server in this project".
+	Always  string `json:"always,omitempty"`
+	Summary string `json:"summary,omitempty"`
+	Output  string `json:"output,omitempty"`
+	Diff    string `json:"diff,omitempty"`
+	Ms      int64  `json:"ms,omitempty"`
+	// Proposed is what a write or edit is about to do, as diff lines, for
+	// its approval card.
+	Proposed string `json:"proposed,omitempty"`
+}
+
+// ChatView is a whole chat, for opening it.
+type ChatView struct {
+	ID      string `json:"id"`
+	Dir     string `json:"dir"`
+	Title   string `json:"title"`
+	Model   string `json:"model"`
+	Effort  string `json:"effort"`
+	Window  int    `json:"window"`
+	Context int    `json:"context"`
+	Running bool   `json:"running"`
+	// Ask says writes and commands wait for approval; otherwise every
+	// permission is bypassed.
+	Ask   bool   `json:"ask"`
+	Items []Item `json:"items"`
+	// Problem is why this chat cannot run right now; NeedsKey says the
+	// problem is that there is no key, as there is none signed out: a
+	// message sent waits for a sign-in.
+	Problem  string `json:"problem,omitempty"`
+	NeedsKey bool   `json:"needsKey,omitempty"`
+}
+
+// ChatHeader is a chat in the sidebar, under the project folder Dir.
+type ChatHeader struct {
+	ID      string `json:"id"`
+	Dir     string `json:"dir"`
+	Title   string `json:"title"`
+	Updated string `json:"updated"`
+	Running bool   `json:"running"`
+}
+
+// ChatEvent tells the window what changed in a chat:
+//
+//	item    Item was added or replaced (matched by ID)
+//	delta   Text or Reasoning goes on the end of item ID
+//	remove  item ID is gone
+//	usage   Context is new
+//	start   a turn began
+//	done    the turn ended; Stats says how it went
+//	title   the model named the chat Title
+type ChatEvent struct {
+	Chat        string     `json:"chat"`
+	Type        string     `json:"type"`
+	Item        *Item      `json:"item,omitempty"`
+	ID          string     `json:"id,omitempty"`
+	Text        string     `json:"text,omitempty"`
+	Reasoning   string     `json:"reasoning,omitempty"`
+	Context     int        `json:"context,omitempty"`
+	Title       string     `json:"title,omitempty"`
+	Interrupted bool       `json:"interrupted,omitempty"`
+	Stats       *TurnStats `json:"stats,omitempty"`
+}
+
+// TurnStats closes a turn: how long, how many tools, how many tokens.
+// It is never in dollars.
+type TurnStats struct {
+	Ms     int64 `json:"ms"`
+	Tools  int   `json:"tools"`
+	Tokens int   `json:"tokens"`
+}
+
+// chat is one conversation the window has open. Its items are the
+// transcript as drawn; the turn goroutine keeps them current under App.mu
+// and tells the window what changed. Nothing outside that goroutine reads
+// the agent while a turn runs.
+type chat struct {
+	id      string
+	dir     string
+	title   string
+	ag      *agent.Agent
+	gen     int
+	problem string
+	// naming says the model has been asked for the chat's name; named,
+	// that title is the name it gave.
+	naming, named bool
+
+	items   []Item
+	seq     int
+	byCall  map[string]string // tool call ID → item ID
+	stream  string            // the assistant item being streamed, "" if none
+	waiting string            // the notice of a busy model being waited out, "" if none
+	context int
+
+	cancel  context.CancelFunc
+	replies map[string]chan<- agent.Decision
+	// held is what was sent while the account could not run this chat,
+	// kept under a sign-in or the plans until it can.
+	held []string
+}
+
+const noKeyProblem = "needs-key"
+
+// outputCap bounds tool output kept for the window; the model has seen
+// all of it already.
+const outputCap = 64 << 10
+
+func newChat(id, dir string, ag *agent.Agent) *chat {
+	return &chat{id: id, dir: dir, ag: ag, byCall: map[string]string{}}
+}
+
+// build makes an agent for dir from the current settings. problem, when
+// set, is why it cannot run; the agent can still show an old chat.
+func (a *App) build(dir string) (ag *agent.Agent, gen int, problem string) {
+	waitShellEnv()
+	cfg, err := config.Load(dir)
+	a.mu.Lock()
+	gen = a.gen
+	a.mu.Unlock()
+	switch {
+	case err != nil:
+		problem = err.Error()
+	case !cfg.OnAccount() && !cfg.Local():
+		problem = noKeyProblem
+	}
+	if st, err := os.Stat(dir); err != nil || !st.IsDir() {
+		problem = fmt.Sprintf("%s is not there any more", dir)
+	}
+	system := prompt.Build(prompt.Options{WorkDir: dir, Model: cfg.Model, Desktop: true, Skills: skills.Section(skills.Enabled(dir))})
+	ag = agent.New(llm.New(cfg.BaseURL, cfg.APIKey), cfg, dir, system)
+	a.equip(ag, dir)
+	return ag, gen, problem
+}
+
+// NewChat starts a chat in dir. An empty chat already open there is
+// reused, so pressing ⌘N twice does not pile them up.
+func (a *App) NewChat(dir string) (ChatView, error) {
+	if _, err := a.OpenProject(dir); err != nil {
+		return ChatView{}, err
+	}
+	a.mu.Lock()
+	for _, c := range a.chats {
+		if c.dir == dir && len(c.items) == 0 && c.cancel == nil && c.gen == a.gen {
+			v := c.view()
+			a.mu.Unlock()
+			return v, nil
+		}
+	}
+	a.mu.Unlock()
+
+	ag, gen, problem := a.build(dir)
+	s := ag.NewSession()
+	ag.Client.Headers["x-caveira-session-id"] = s.ID
+	c := newChat(s.ID, dir, ag)
+	c.gen, c.problem = gen, problem
+
+	a.mu.Lock()
+	a.chats[c.id] = c
+	v := c.view()
+	a.mu.Unlock()
+	a.relayTouch(c.id)
+	return v, nil
+}
+
+// OpenChat opens a saved chat, or returns one already open. An open chat
+// left idle across a settings change is brought up to date first, so the
+// window shows whether it can run now.
+func (a *App) OpenChat(id string) (ChatView, error) {
+	a.mu.Lock()
+	if c, ok := a.chats[id]; ok {
+		stale := c.cancel == nil && c.gen != a.gen
+		a.mu.Unlock()
+		if stale {
+			a.rebuild(c)
+		}
+		a.mu.Lock()
+		defer a.mu.Unlock()
+		return c.view(), nil
+	}
+	a.mu.Unlock()
+
+	s, err := agent.LoadSession(id)
+	if err != nil {
+		return ChatView{}, fmt.Errorf("cannot open that chat: %w", err)
+	}
+	if s.Source != "" {
+		// Carried on in the app it came from since: bring that over.
+		home, _ := os.UserHomeDir()
+		if _, err := importer.Refresh(s, home); err != nil {
+			log.Printf("refresh %s: %v", s.ID, err)
+		}
+	}
+	ag, gen, problem := a.build(s.WorkDir)
+	ag.Attach(s)
+	ag.Client.Headers["x-caveira-session-id"] = s.ID
+	c := newChat(s.ID, s.WorkDir, ag)
+	c.title, c.gen, c.problem = s.Title, gen, problem
+	if s.Source != "" {
+		c.push(Item{Kind: "notice", Tone: "info", Text: "Imported from " + s.Source + "."})
+	}
+	c.load(s.History(), ag)
+
+	a.mu.Lock()
+	if open, ok := a.chats[id]; ok {
+		defer a.mu.Unlock()
+		return open.view(), nil
+	}
+	a.chats[id] = c
+	v := c.view()
+	a.mu.Unlock()
+	// One still going by its first line gets the small model's name.
+	if problem == "" {
+		a.name(c)
+	}
+	a.relayTouch(id)
+	return v, nil
+}
+
+// Chats lists the saved chats for dir, newest first; every project's
+// when dir is empty, which the sidebar sorts into its folders. Only each
+// file's header is read, so all of them is cheap.
+func (a *App) Chats(dir string) ([]ChatHeader, error) {
+	sessions, err := agent.ListSessions(dir)
+	if err != nil {
+		return nil, err
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	out := make([]ChatHeader, 0, len(sessions))
+	for _, s := range sessions {
+		h := ChatHeader{ID: s.ID, Dir: s.WorkDir, Title: s.Title, Updated: s.UpdatedAt.Format(time.RFC3339)}
+		if c, ok := a.chats[s.ID]; ok {
+			h.Running = c.cancel != nil
+		}
+		out = append(out, h)
+	}
+	return out, nil
+}
+
+func (a *App) DeleteChat(id string) error {
+	a.mu.Lock()
+	if c, ok := a.chats[id]; ok {
+		if c.cancel != nil {
+			a.mu.Unlock()
+			return errors.New("stop this chat before deleting it")
+		}
+		delete(a.chats, id)
+	}
+	a.mu.Unlock()
+	if err := agent.DeleteSession(id); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	return nil
+}
+
+// Send starts a turn, and says whether it did: a message the account
+// cannot run is held under a sign-in or the plans instead. It returns at
+// once; the turn reports through events.
+func (a *App) Send(id, text string) (bool, error) {
+	if text == "" {
+		return false, nil
+	}
+	a.mu.Lock()
+	c, ok := a.chats[id]
+	if !ok {
+		a.mu.Unlock()
+		return false, errors.New("that chat is not open")
+	}
+	stale := c.cancel == nil && (c.gen != a.gen || c.problem != "")
+	a.mu.Unlock()
+	if stale {
+		a.rebuild(c)
+	}
+
+	a.mu.Lock()
+	if c.cancel != nil {
+		a.mu.Unlock()
+		return false, errors.New("caveira is still working on the last message")
+	}
+	// Signed out there is nowhere to send; allows holds the message under
+	// a sign-in, which brings the account.
+	if c.problem != "" && (c.problem != noKeyProblem || a.acct.signedIn()) {
+		p := c.problem
+		a.mu.Unlock()
+		if p == noKeyProblem {
+			// Signed in, but the chat was built before and still is not.
+			return false, errors.New("caveira has nowhere to send this: sign in again")
+		}
+		return false, errors.New(p)
+	}
+	model, _ := c.ag.ModelInfo()
+	if ok, locked := allows(a.acct, model, c.local()); !ok {
+		out := c.hold(text, locked)
+		a.mu.Unlock()
+		for _, e := range out {
+			a.emit("chat", e)
+		}
+		a.watch()
+		return false, nil
+	} else if len(c.held) > 0 {
+		// The account runs it since: what was held goes with this.
+		c.held = append(c.held, text)
+		ev := c.push(Item{Kind: "user", Text: text})
+		a.mu.Unlock()
+		a.emit("chat", ev)
+		a.release(id)
+		return true, nil
+	}
+	ctx := c.begin()
+	ev := c.push(Item{Kind: "user", Text: text})
+	ag := c.ag
+	a.mu.Unlock()
+
+	a.emit("chat", ev)
+	go a.turn(ctx, c, ag, func(ctx context.Context, emit func(agent.Event)) { ag.Run(ctx, text, emit) })
+	return true, nil
+}
+
+// Retry takes up the chat's last turn again, after it gave up waiting out
+// a busy model, and says whether it did.
+func (a *App) Retry(id string) (bool, error) {
+	a.mu.Lock()
+	c, ok := a.chats[id]
+	if !ok {
+		a.mu.Unlock()
+		return false, errors.New("that chat is not open")
+	}
+	stale := c.cancel == nil && (c.gen != a.gen || c.problem != "")
+	a.mu.Unlock()
+	if stale {
+		a.rebuild(c)
+	}
+
+	a.mu.Lock()
+	if c.cancel != nil {
+		a.mu.Unlock()
+		return false, errors.New("caveira is still working on the last message")
+	}
+	if c.problem != "" {
+		p := c.problem
+		a.mu.Unlock()
+		return false, errors.New(p)
+	}
+	model, _ := c.ag.ModelInfo()
+	if ok, _ := allows(a.acct, model, c.local()); !ok {
+		a.mu.Unlock()
+		return false, errors.New("your plan does not run " + model + " now; send a message to see why")
+	}
+	if !c.ag.CanContinue() {
+		a.mu.Unlock()
+		return false, errors.New("there is nothing to try again; send a message instead")
+	}
+	// The Try again button has done its work.
+	var out []ChatEvent
+	for i := range c.items {
+		if it := &c.items[i]; it.Action == "retry" {
+			it.Action = ""
+			out = append(out, c.itemEvent(it))
+		}
+	}
+	ctx := c.begin()
+	ag := c.ag
+	a.mu.Unlock()
+
+	for _, e := range out {
+		a.emit("chat", e)
+	}
+	go a.turn(ctx, c, ag, ag.Continue)
+	return true, nil
+}
+
+// begin marks a turn as running and gives it the context Stop cancels.
+// Caller holds App.mu.
+func (c *chat) begin() context.Context {
+	ctx, cancel := context.WithCancel(context.Background())
+	c.cancel = cancel
+	c.replies = map[string]chan<- agent.Decision{}
+	return ctx
+}
+
+// rebuild gives an idle chat an agent made from the current settings,
+// keeping its conversation.
+func (a *App) rebuild(c *chat) {
+	ag, gen, problem := a.build(c.dir)
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if c.cancel != nil {
+		return
+	}
+	old := c.ag
+	ag.Session, ag.Messages, ag.Totals = old.Session, old.Messages, old.Totals
+	if ag.Session != nil {
+		ag.Client.Headers["x-caveira-session-id"] = ag.Session.ID
+	}
+	c.ag, c.gen, c.problem = ag, gen, problem
+}
+
+// turn runs one turn of the chat's agent, Run or Continue, and folds its
+// events into the transcript.
+func (a *App) turn(ctx context.Context, c *chat, ag *agent.Agent, run func(context.Context, func(agent.Event))) {
+	a.emit("chat", ChatEvent{Chat: c.id, Type: "start"})
+	a.name(c)
+	start := time.Now()
+	spent := ag.Totals.InputTokens + ag.Totals.OutputTokens
+	tools := 0
+	interrupted := false
+	// site says the caveira site turned the turn away: signed out, out of
+	// usage, or a plan without the model. What it says now is asked after.
+	site := false
+	run(ctx, func(ev agent.Event) {
+		switch ev := ev.(type) {
+		case agent.ToolStartEvent:
+			tools++
+		case agent.DoneEvent:
+			interrupted = ev.Interrupted
+		case agent.ErrorEvent:
+			site = site || siteError(ev.Err) != nil
+			log.Printf("chat %s: turn failed: %v", c.id, ev.Err)
+		}
+		a.mu.Lock()
+		out := c.apply(ev)
+		a.mu.Unlock()
+		for _, e := range out {
+			a.emit("chat", e)
+		}
+	})
+
+	a.mu.Lock()
+	c.cancel, c.replies = nil, nil
+	c.endStream()
+	if ag.Session != nil {
+		c.keepName()
+		c.title = ag.Session.Title
+	}
+	done := ChatEvent{
+		Chat: c.id, Type: "done", Title: c.title, Interrupted: interrupted,
+		Stats: &TurnStats{Ms: time.Since(start).Milliseconds(), Tools: tools, Tokens: ag.Totals.InputTokens + ag.Totals.OutputTokens - spent},
+	}
+	// On the account, the turn spent some of its usage: the bar in the
+	// sidebar and Settings follow.
+	site = site || !c.local()
+	a.mu.Unlock()
+	a.emit("chat", done)
+	if site {
+		a.refreshAccount()
+	}
+}
+
+// Stop interrupts the turn running in a chat.
+func (a *App) Stop(id string) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if c, ok := a.chats[id]; ok && c.cancel != nil {
+		c.cancel()
+	}
+}
+
+// stopAll stops everything the app has going, as the window closes: the
+// turns, a sign-in waiting on the browser, and watching the account.
+func (a *App) stopAll() {
+	a.stopRelay(true)
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.watchUntil = time.Time{}
+	if a.signing != nil {
+		a.signing.cancel()
+		a.signing = nil
+	}
+	for _, c := range a.chats {
+		if c.cancel != nil {
+			c.cancel()
+		}
+	}
+	// MCP servers are processes of their own; they go with the app.
+	for root, m := range a.mcp {
+		m.Close()
+		delete(a.mcp, root)
+	}
+}
+
+// Answer replies to an approval: "allow", "always", or "deny".
+func (a *App) Answer(id, callID, decision string) {
+	d := agent.Deny
+	switch decision {
+	case "allow":
+		d = agent.Allow
+	case "always":
+		d = agent.AllowAlways
+	}
+	a.mu.Lock()
+	c, ok := a.chats[id]
+	if !ok || c.replies[callID] == nil {
+		a.mu.Unlock()
+		return
+	}
+	reply := c.replies[callID]
+	delete(c.replies, callID)
+	var out []ChatEvent
+	if d != agent.Deny {
+		if it := c.find(c.byCall[callID]); it != nil && it.Tool != nil {
+			it.Tool.Status = "running"
+			out = append(out, c.itemEvent(it))
+		}
+	}
+	a.mu.Unlock()
+	reply <- d
+	for _, e := range out {
+		a.emit("chat", e)
+	}
+}
+
+// SetModel switches a chat's model and makes it the default for new ones.
+// A message held for a model the plan lacks goes once the plan runs the
+// new one.
+func (a *App) SetModel(id, model string, window int, effort string) (ChatView, error) {
+	if effort != "" && !config.ValidEffort(effort) {
+		return ChatView{}, fmt.Errorf("unknown reasoning effort %q", effort)
+	}
+	a.mu.Lock()
+	c, ok := a.chats[id]
+	if !ok {
+		a.mu.Unlock()
+		return ChatView{}, errors.New("that chat is not open")
+	}
+	if c.cancel != nil {
+		v := c.view()
+		a.mu.Unlock()
+		return v, errors.New("wait for this turn to finish before switching models")
+	}
+	c.ag.SetModel(model, window)
+	c.ag.Effort = effort
+	c.ag.System = prompt.Build(prompt.Options{WorkDir: c.dir, Model: model, Desktop: true})
+	a.mu.Unlock()
+
+	err := saveModel(model, effort)
+	a.release(id)
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return c.view(), err
+}
+
+// SetPermissions has a chat ask before writes and commands, or bypass
+// every permission, and makes that the default for new chats. It works
+// mid-turn: the next tool call goes by it, and bypassing answers any
+// approval already waiting with Allow.
+func (a *App) SetPermissions(id string, ask bool) (ChatView, error) {
+	a.mu.Lock()
+	c, ok := a.chats[id]
+	if !ok {
+		a.mu.Unlock()
+		return ChatView{}, errors.New("that chat is not open")
+	}
+	c.ag.SetConfirm(ask)
+	var waiting []string
+	if !ask {
+		for call := range c.replies {
+			waiting = append(waiting, call)
+		}
+	}
+	a.mu.Unlock()
+	for _, call := range waiting {
+		a.Answer(id, call, "allow")
+	}
+
+	err := saveConfirm(ask)
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return c.view(), err
+}
+
+// saveConfirm makes asking first, or not, the default in config.json.
+func saveConfirm(ask bool) error {
+	file, err := config.ReadFile()
+	if err != nil {
+		return err
+	}
+	file.Confirm = ask
+	return config.Save(file)
+}
+
+// saveModel makes model and effort the defaults in config.json.
+func saveModel(model, effort string) error {
+	file, err := config.ReadFile()
+	if err != nil {
+		return err
+	}
+	file.Model = unlessDefault(model, config.DefaultModel)
+	file.ReasoningEffort = effort
+	return config.Save(file)
+}
+
+// view is a copy of the chat for the window. Caller holds App.mu.
+func (c *chat) view() ChatView {
+	items := make([]Item, len(c.items))
+	for i, it := range c.items {
+		items[i] = copyItem(it)
+	}
+	model, window := c.ag.ModelInfo()
+	v := ChatView{
+		ID: c.id, Dir: c.dir, Title: c.title,
+		Model: model, Effort: c.ag.Effort, Window: window,
+		Context: c.context, Running: c.cancel != nil, Ask: c.ag.Confirming(), Items: items,
+	}
+	if c.problem == noKeyProblem {
+		v.NeedsKey = true
+	} else {
+		v.Problem = c.problem
+	}
+	return v
+}
+
+func copyItem(it Item) Item {
+	if it.Tool != nil {
+		t := *it.Tool
+		it.Tool = &t
+	}
+	return it
+}
+
+func (c *chat) push(it Item) ChatEvent {
+	c.seq++
+	it.ID = fmt.Sprintf("i%d", c.seq)
+	c.items = append(c.items, it)
+	return c.itemEvent(&c.items[len(c.items)-1])
+}
+
+func (c *chat) itemEvent(it *Item) ChatEvent {
+	cp := copyItem(*it)
+	return ChatEvent{Chat: c.id, Type: "item", Item: &cp}
+}
+
+func (c *chat) find(id string) *Item {
+	if id == "" {
+		return nil
+	}
+	for i := len(c.items) - 1; i >= 0; i-- {
+		if c.items[i].ID == id {
+			return &c.items[i]
+		}
+	}
+	return nil
+}
+
+func (c *chat) remove(id string) {
+	for i := len(c.items) - 1; i >= 0; i-- {
+		if c.items[i].ID == id {
+			c.items = append(c.items[:i], c.items[i+1:]...)
+			return
+		}
+	}
+}
+
+// streaming is the assistant item text is streaming into, made if there
+// is none; fresh says it was just made.
+func (c *chat) streaming() (it *Item, fresh bool) {
+	if it := c.find(c.stream); it != nil {
+		return it, false
+	}
+	c.push(Item{Kind: "assistant", Streaming: true})
+	it = &c.items[len(c.items)-1]
+	c.stream = it.ID
+	return it, true
+}
+
+func (c *chat) endStream() {
+	if it := c.find(c.stream); it != nil {
+		it.Streaming = false
+	}
+	c.stream = ""
+}
+
+// apply folds one agent event into the transcript and says what the
+// window needs to hear about it. Caller holds App.mu.
+func (c *chat) apply(ev agent.Event) []ChatEvent {
+	if r, ok := ev.(agent.RetryEvent); ok {
+		return c.wait(r)
+	}
+	// Anything else means the wait for a busy model is over.
+	var out []ChatEvent
+	if c.waiting != "" {
+		out = append(out, ChatEvent{Chat: c.id, Type: "remove", ID: c.waiting})
+		c.remove(c.waiting)
+		c.waiting = ""
+	}
+	return append(out, c.fold(ev)...)
+}
+
+// wait shows a busy model being waited out: what streamed of the reply
+// that failed goes, as it streams again from the start, and one notice
+// counts down to the next try.
+func (c *chat) wait(r agent.RetryEvent) []ChatEvent {
+	var out []ChatEvent
+	if c.stream != "" {
+		out = append(out, ChatEvent{Chat: c.id, Type: "remove", ID: c.stream})
+		c.remove(c.stream)
+		c.stream = ""
+	}
+	if it := c.find(c.waiting); it != nil {
+		it.Text, it.Until = r.Label(), r.Until.UnixMilli()
+		return append(out, c.itemEvent(it))
+	}
+	e := c.push(Item{Kind: "notice", Tone: "info", Text: r.Label(), Until: r.Until.UnixMilli()})
+	c.waiting = e.Item.ID
+	return append(out, e)
+}
+
+// fold is apply for every event but a RetryEvent.
+func (c *chat) fold(ev agent.Event) []ChatEvent {
+	switch ev := ev.(type) {
+	case agent.TextEvent:
+		it, fresh := c.streaming()
+		it.Text += ev.Delta
+		if fresh {
+			return []ChatEvent{c.itemEvent(it)}
+		}
+		return []ChatEvent{{Chat: c.id, Type: "delta", ID: it.ID, Text: ev.Delta}}
+
+	case agent.ReasoningEvent:
+		it, fresh := c.streaming()
+		it.Reasoning += ev.Delta
+		if fresh {
+			return []ChatEvent{c.itemEvent(it)}
+		}
+		return []ChatEvent{{Chat: c.id, Type: "delta", ID: it.ID, Reasoning: ev.Delta}}
+
+	case agent.AssistantDoneEvent:
+		m := ev.Message
+		it := c.find(c.stream)
+		c.stream = ""
+		if it == nil {
+			if m.Content == "" && m.Reasoning == "" {
+				return nil
+			}
+			return []ChatEvent{c.push(Item{Kind: "assistant", Text: m.Content, Reasoning: m.Reasoning})}
+		}
+		// What streamed is replaced by what the message says: a reply
+		// that was a tool call written as text is gone from it.
+		it.Text = m.Content
+		if m.Reasoning != "" {
+			it.Reasoning = m.Reasoning
+		}
+		it.Streaming = false
+		if it.Text == "" && it.Reasoning == "" {
+			id := it.ID
+			c.remove(id)
+			return []ChatEvent{{Chat: c.id, Type: "remove", ID: id}}
+		}
+		return []ChatEvent{c.itemEvent(it)}
+
+	case agent.ToolStartEvent:
+		e := c.push(Item{Kind: "tool", Tool: &ToolView{
+			Call: ev.ID, Name: ev.Name, Label: toolLabel(ev.Name), Preview: ev.Preview,
+			Kind: ev.Kind.String(), Status: "running", Proposed: proposed(ev.Name, ev.Args),
+		}})
+		c.byCall[ev.ID] = e.Item.ID
+		return []ChatEvent{e}
+
+	case agent.ApprovalEvent:
+		if c.replies != nil {
+			c.replies[ev.ID] = ev.Reply
+		}
+		it := c.find(c.byCall[ev.ID])
+		if it == nil || it.Tool == nil {
+			return nil
+		}
+		it.Tool.Status = "approval"
+		it.Tool.Always = ev.Always
+		return []ChatEvent{c.itemEvent(it)}
+
+	case agent.ToolEndEvent:
+		it := c.find(c.byCall[ev.ID])
+		if it == nil || it.Tool == nil {
+			return nil
+		}
+		t := it.Tool
+		t.Status = "done"
+		if ev.Result.IsError {
+			t.Status = "error"
+		}
+		t.Summary = ev.Result.Summary
+		t.Output = bound(ev.Result.Output)
+		t.Diff = bound(ev.Result.Diff)
+		t.Ms = ev.Duration.Milliseconds()
+		return []ChatEvent{c.itemEvent(it)}
+
+	case agent.UsageEvent:
+		if ev.ContextTokens > 0 {
+			c.context = ev.ContextTokens
+		}
+		return []ChatEvent{{Chat: c.id, Type: "usage", Context: c.context}}
+
+	case agent.CompactingEvent:
+		return []ChatEvent{c.push(Item{Kind: "notice", Tone: "info", Text: sentence(ev.Text())})}
+
+	case agent.CompactEvent:
+		c.context = 0
+		return []ChatEvent{c.push(Item{Kind: "notice", Tone: "info", Text: sentence(ev.Text())})}
+
+	case agent.ErrorEvent:
+		if e := siteError(ev.Err); e != nil && e.Status == http.StatusUnauthorized {
+			return []ChatEvent{c.push(Item{
+				Kind: "notice", Tone: "error", Action: "sign-in",
+				Text: "Your caveira sign-in ran out or was revoked. Sign in again, then send your message once more.",
+			})}
+		}
+		var gaveUp *agent.GaveUpError
+		if errors.As(ev.Err, &gaveUp) {
+			return []ChatEvent{c.push(Item{Kind: "notice", Tone: "error", Action: "retry", Text: sentence(ev.Err.Error())})}
+		}
+		return []ChatEvent{c.push(Item{Kind: "notice", Tone: "error", Text: ev.Err.Error()})}
+
+	case agent.DoneEvent:
+		c.endStream()
+		if ev.Interrupted {
+			return []ChatEvent{c.push(Item{Kind: "notice", Tone: "info", Text: "Stopped."})}
+		}
+	}
+	return nil
+}
+
+// proposed shows an edit as its old lines taken out and new ones put in,
+// and a write as the lines it writes.
+func proposed(name string, args json.RawMessage) string {
+	var a struct {
+		OldString string `json:"old_string"`
+		NewString string `json:"new_string"`
+		Content   string `json:"content"`
+	}
+	if json.Unmarshal(args, &a) != nil {
+		return ""
+	}
+	lines := func(s, sign string) string {
+		if s == "" {
+			return ""
+		}
+		var sb strings.Builder
+		for _, l := range strings.Split(strings.TrimSuffix(s, "\n"), "\n") {
+			sb.WriteString(sign + l + "\n")
+		}
+		return sb.String()
+	}
+	switch name {
+	case "edit_file":
+		return bound(strings.TrimSuffix(lines(a.OldString, "-")+lines(a.NewString, "+"), "\n"))
+	case "write_file":
+		return bound(strings.TrimSuffix(lines(a.Content, "+"), "\n"))
+	}
+	return ""
+}
+
+func bound(s string) string {
+	if len(s) <= outputCap {
+		return s
+	}
+	return s[:outputCap] + "\n…"
+}
+
+var toolLabels = map[string]string{
+	"read_file":  "Read",
+	"write_file": "Write",
+	"edit_file":  "Edit",
+	"bash":       "Run",
+	"glob":       "Find",
+	"grep":       "Search",
+	"list_dir":   "List",
+
+	// Tools other agents have, in chats imported from them.
+	"apply_patch": "Patch",
+	"exec":        "Script",
+	"Task":        "Agent",
+	"Agent":       "Agent",
+	"task":        "Agent",
+	"WebFetch":    "Fetch",
+	"webfetch":    "Fetch",
+	"WebSearch":   "Web search",
+	"websearch":   "Web search",
+	"web_search":  "Web search",
+	"TodoWrite":   "Plan",
+	"todowrite":   "Plan",
+	"update_plan": "Plan",
+	"MultiEdit":   "Edit",
+	"view_image":  "View",
+	"skill":       "Skill",
+}
+
+func toolLabel(name string) string {
+	if _, _, ok := mcp.SplitName(name); ok {
+		return "MCP"
+	}
+	if l, ok := toolLabels[name]; ok {
+		return l
+	}
+	return name
+}

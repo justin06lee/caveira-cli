@@ -1,0 +1,577 @@
+// One small store for the whole window. Go is the source of truth for
+// transcripts; this holds what has been fetched and folds in the events
+// that arrive while turns run, a frame at a time.
+
+import { useSyncExternalStore } from "react";
+import { api, errorText, onAccount, onChatEvent, onUpdate } from "./bridge";
+import type {
+  AccountView,
+  ChatEvent,
+  ChatHeader,
+  ChatView,
+  Item,
+  ModelOption,
+  Plan,
+  Project,
+  SettingsInput,
+  SettingsView,
+  TurnStats,
+  UpdateView,
+  Workspace,
+} from "./types";
+
+export interface Chat extends ChatView {
+  // turns closes each finished turn with its stats, after the item that
+  // ended it.
+  turns: { after: string; stats: TurnStats }[];
+  // started is when the running turn began, as this window saw it.
+  started?: number;
+}
+
+export interface State {
+  ready: boolean;
+  version: string;
+  settings: SettingsView | null;
+  projects: Project[];
+  // project is where the open chat is, and where ⌘N (Ctrl+N) starts one.
+  project: Project | null;
+  // headers is every project's saved chats, newest first; the sidebar
+  // sorts them into its folders by dir.
+  headers: ChatHeader[];
+  // expanded is the project folders open in the sidebar, by path.
+  expanded: string[];
+  chatId: string | null;
+  chats: Record<string, Chat>;
+  settingsOpen: boolean;
+  sidebar: boolean;
+  toast: string | null;
+  // onboarded is false until the first-run steps are done or skipped.
+  onboarded: boolean;
+  // workspace is where the project picker opens; empty means home.
+  workspace: Workspace;
+  pickerOpen: boolean;
+  importOpen: boolean;
+  // account is the caveira account, null before boot. A message it cannot
+  // run is held under a sign-in, or under the plans.
+  account: AccountView | null;
+  plans: Plan[];
+  // catalog is the models on offer.
+  catalog: ModelOption[];
+  // update is a newer release, when the app has found one.
+  update: UpdateView;
+}
+
+let state: State = {
+  ready: false,
+  version: "",
+  settings: null,
+  projects: [],
+  project: null,
+  headers: [],
+  expanded: [],
+  chatId: null,
+  chats: {},
+  settingsOpen: false,
+  sidebar: true,
+  toast: null,
+  onboarded: true,
+  workspace: { path: "", short: "" },
+  pickerOpen: false,
+  importOpen: false,
+  account: null,
+  plans: [],
+  catalog: [],
+  update: { version: "", installing: false, ready: false },
+};
+
+const listeners = new Set<() => void>();
+
+export function getState(): State {
+  return state;
+}
+
+export function setState(fn: (s: State) => Partial<State>): void {
+  state = { ...state, ...fn(state) };
+  listeners.forEach((l) => l());
+}
+
+export function useStore<T>(select: (s: State) => T): T {
+  return useSyncExternalStore(
+    (l) => {
+      listeners.add(l);
+      return () => listeners.delete(l);
+    },
+    () => select(state),
+  );
+}
+
+// inputFrom is a settings change that changes nothing, to start from.
+export function inputFrom(s: SettingsView): SettingsInput {
+  return { model: s.model, effort: s.effort, confirm: s.confirm, theme: s.theme };
+}
+
+let toastTimer: number | undefined;
+
+export function toast(e: unknown): void {
+  const text = errorText(e);
+  setState(() => ({ toast: text }));
+  window.clearTimeout(toastTimer);
+  toastTimer = window.setTimeout(() => setState(() => ({ toast: null })), 6000);
+}
+
+const LAST_PROJECT = "caveira.project";
+const LAST_CHAT = "caveira.chat";
+const EXPANDED = "caveira.expanded";
+
+function loadExpanded(): string[] | null {
+  try {
+    const v = JSON.parse(localStorage.getItem(EXPANDED) ?? "null");
+    return Array.isArray(v) ? v.filter((x) => typeof x === "string") : null;
+  } catch {
+    return null;
+  }
+}
+
+function saveExpanded(expanded: string[]): void {
+  localStorage.setItem(EXPANDED, JSON.stringify(expanded));
+}
+
+// toggleFolder opens or closes a project folder in the sidebar.
+export function toggleFolder(path: string): void {
+  setState((s) => ({
+    expanded: s.expanded.includes(path) ? s.expanded.filter((x) => x !== path) : [...s.expanded, path],
+  }));
+  saveExpanded(getState().expanded);
+}
+
+// expand opens the folder the open chat is in, however it got opened.
+function expand(path: string): void {
+  if (getState().expanded.includes(path)) return;
+  setState((s) => ({ expanded: [...s.expanded, path] }));
+  saveExpanded(getState().expanded);
+}
+
+// boot comes back to the project and chat the window last showed. The
+// project is in place before the first frame, so the window does not
+// flash the welcome screen on its way there.
+export async function boot(): Promise<void> {
+  const b = await api.boot();
+  const last = localStorage.getItem(LAST_PROJECT);
+  const project = b.projects.find((p) => p.path === last) ?? b.projects[0] ?? null;
+  const headers = (await api.chats("").catch(() => null)) ?? [];
+  setState(() => ({
+    ready: true,
+    version: b.version,
+    settings: b.settings,
+    projects: b.projects,
+    project,
+    headers,
+    expanded: loadExpanded() ?? [],
+    onboarded: b.onboarded,
+    workspace: b.workspace,
+    account: b.account,
+    plans: b.plans ?? [],
+    update: b.update ?? { version: "", installing: false, ready: false },
+  }));
+  refreshCatalog();
+  refreshAccount();
+  if (project) await selectProject(project, localStorage.getItem(LAST_CHAT) ?? undefined);
+}
+
+// openPath opens the folder at path as the project, from the picker.
+export async function openPath(path: string): Promise<void> {
+  setState(() => ({ pickerOpen: false }));
+  await selectProject({ path, name: "", short: "", branch: "" });
+}
+
+// makeProject creates a folder under base and opens it.
+export async function makeProject(base: string, rel: string): Promise<void> {
+  try {
+    const p = await api.makeFolder(base, rel);
+    setState(() => ({ pickerOpen: false }));
+    await selectProject(p);
+  } catch (e) {
+    toast(e);
+  }
+}
+
+// refreshCatalog reads the models on offer.
+export function refreshCatalog(): void {
+  api
+    .models()
+    .then((m) => setState(() => ({ catalog: m ?? [] })))
+    .catch(() => {});
+}
+
+// Drafts outlive switching chats.
+export const drafts = new Map<string, string>();
+
+// restartIfIdle starts the version an update at launch put in place, unless
+// that would cost something: a chat going, words half-typed, or first-run
+// setup under way. Those keep the Restart button instead.
+function restartIfIdle(): void {
+  const s = getState();
+  const busy = Object.values(s.chats).some((c) => c.running);
+  const typing = [...drafts.values()].some((d) => d.trim() !== "");
+  if (!busy && !typing && s.onboarded) void api.restartForUpdate();
+}
+
+// installUpdate replaces the app with the newer release; the app reopens
+// on its own, or says why it could not.
+export async function installUpdate(): Promise<void> {
+  try {
+    await api.installUpdate();
+  } catch (e) {
+    toast(e);
+  }
+}
+
+// subscribe opens the plan's checkout on the caveira site in the browser.
+// Go watches the account while a message is held, and sends it once the
+// plan runs it.
+export async function subscribe(plan: string): Promise<void> {
+  try {
+    await api.subscribe(plan);
+  } catch (e) {
+    toast(e);
+  }
+}
+
+// setAccount takes in what Go says about the account. Signing in or out
+// changes where chats go, so the models and the open chat are read again.
+function setAccount(a: AccountView): void {
+  const was = getState().account;
+  setState(() => ({ account: a }));
+  if (a.error) toast(a.error);
+  if (was && was.signedIn !== a.signedIn) {
+    refreshCatalog();
+    const id = getState().chatId;
+    if (id) refreshChat(id).catch(() => {});
+  }
+}
+
+// refreshAccount asks the site about the account, as the window comes to
+// the front; what chats were holding goes if it runs them now.
+export async function refreshAccount(): Promise<void> {
+  try {
+    setAccount(await api.account());
+  } catch {
+    // The account stays as it was last known.
+  }
+}
+
+// signIn opens the site's sign-in page in the browser; the window shows
+// its code until it goes through.
+export async function signIn(): Promise<void> {
+  try {
+    setAccount(await api.signIn());
+  } catch (e) {
+    toast(e);
+  }
+}
+
+export async function cancelSignIn(): Promise<void> {
+  try {
+    setAccount(await api.cancelSignIn());
+  } catch (e) {
+    toast(e);
+  }
+}
+
+export async function signOut(): Promise<void> {
+  try {
+    setAccount(await api.signOut());
+  } catch (e) {
+    toast(e);
+  }
+}
+
+export async function refreshProjects(): Promise<void> {
+  const projects = (await api.projects()) ?? [];
+  setState(() => ({ projects }));
+}
+
+// selectProject switches to p and opens a fresh chat there, or the chat
+// resume names if it belongs to p.
+export async function selectProject(p: Project, resume?: string): Promise<void> {
+  try {
+    await enter(p.path);
+    const s = getState();
+    if (resume && s.headers.some((h) => h.id === resume && h.dir === s.project?.path)) await openChat(resume);
+    else await newChat();
+  } catch (e) {
+    toast(e);
+  }
+}
+
+function freshen(p: Project): void {
+  setState((s) => ({
+    projects: s.projects.map((x) => (x.path === p.path ? p : x)),
+    project: s.project?.path === p.path ? p : s.project,
+  }));
+}
+
+// enter makes dir the project, opening its folder in the sidebar. A
+// project already there keeps its place, so the folders do not shuffle
+// under the pointer; a new one goes on top.
+async function enter(dir: string): Promise<void> {
+  const fresh = await api.openProject(dir);
+  localStorage.setItem(LAST_PROJECT, fresh.path);
+  const known = getState().projects.some((x) => x.path === fresh.path);
+  setState((s) => ({
+    project: fresh,
+    projects: known ? s.projects.map((x) => (x.path === fresh.path ? fresh : x)) : [fresh, ...s.projects],
+  }));
+  expand(fresh.path);
+  if (!known) await refreshHeaders();
+}
+
+export async function chooseProject(): Promise<void> {
+  try {
+    const p = await api.chooseProject();
+    if (p.path) {
+      setState(() => ({ pickerOpen: false }));
+      await selectProject(p);
+    }
+  } catch (e) {
+    toast(e);
+  }
+}
+
+// forgetProject takes p out of the sidebar. Its folder and its chats stay
+// where they are; opening it again brings them back.
+export async function forgetProject(p: Project): Promise<void> {
+  try {
+    await api.forgetProject(p.path);
+  } catch (e) {
+    toast(e);
+    return;
+  }
+  setState((s) => ({
+    projects: s.projects.filter((x) => x.path !== p.path),
+    expanded: s.expanded.filter((x) => x !== p.path),
+  }));
+  saveExpanded(getState().expanded);
+  const s = getState();
+  if (s.project?.path === p.path) {
+    localStorage.removeItem(LAST_PROJECT);
+    setState(() => ({ project: null, chatId: null }));
+    if (s.projects[0]) await selectProject(s.projects[0]);
+  }
+}
+
+function withTurns(v: ChatView, old?: Chat): Chat {
+  return { ...v, items: v.items ?? [], turns: old?.turns ?? [] };
+}
+
+// newChat starts a chat in the project at dir, or in the current one.
+export async function newChat(dir?: string): Promise<void> {
+  try {
+    if (dir && dir !== getState().project?.path) await enter(dir);
+    const p = getState().project;
+    if (!p) return;
+    setState(() => ({ chatId: null, settingsOpen: false }));
+    const v = await api.newChat(p.path);
+    localStorage.setItem(LAST_CHAT, v.id);
+    setState((s) => ({
+      chatId: v.id,
+      chats: { ...s.chats, [v.id]: withTurns(v, s.chats[v.id]) },
+    }));
+  } catch (e) {
+    toast(e);
+  }
+}
+
+// openChat opens a saved chat, switching to its project if it is in
+// another one.
+export async function openChat(id: string): Promise<void> {
+  localStorage.setItem(LAST_CHAT, id);
+  const s = getState();
+  const dir = s.headers.find((h) => h.id === id)?.dir ?? s.chats[id]?.dir;
+  const owner = dir && dir !== s.project?.path ? s.projects.find((p) => p.path === dir) : undefined;
+  if (owner) {
+    localStorage.setItem(LAST_PROJECT, owner.path);
+    setState(() => ({ project: owner }));
+    // Read again behind it: the branch may have moved since the list was.
+    api.openProject(owner.path).then(freshen, () => {});
+  }
+  if (dir) expand(dir);
+  setState(() => ({ chatId: id, settingsOpen: false }));
+  const first = !s.chats[id];
+  try {
+    const v = await api.openChat(id);
+    setState((s) => ({
+      chats: { ...s.chats, [id]: withTurns(v, s.chats[id]) },
+    }));
+    // An imported chat is brought up to date as it opens, which can move it.
+    if (first) refreshHeaders().catch(() => {});
+  } catch (e) {
+    toast(e);
+  }
+}
+
+export async function refreshChat(id: string): Promise<void> {
+  const v = await api.openChat(id);
+  setState((s) => ({ chats: { ...s.chats, [id]: withTurns(v, s.chats[id]) } }));
+}
+
+export async function refreshHeaders(): Promise<void> {
+  const headers = (await api.chats("")) ?? [];
+  setState(() => ({ headers }));
+}
+
+// renameChat names a chat by hand; the small model leaves that name be.
+export async function renameChat(id: string, title: string): Promise<void> {
+  title = title.trim().replace(/\s+/g, " ");
+  if (!title) return;
+  try {
+    await api.renameChat(id, title);
+    // Shown at once, open or not; the title event only reaches open chats.
+    setState((s) => ({
+      headers: s.headers.map((h) => (h.id === id ? { ...h, title } : h)),
+      chats: s.chats[id] ? { ...s.chats, [id]: { ...s.chats[id], title } } : s.chats,
+    }));
+  } catch (e) {
+    toast(e);
+  }
+}
+
+export async function deleteChat(id: string): Promise<void> {
+  try {
+    await api.deleteChat(id);
+    setState((s) => {
+      const chats = { ...s.chats };
+      delete chats[id];
+      return { chats, headers: s.headers.filter((h) => h.id !== id) };
+    });
+    if (getState().chatId === id) {
+      const dir = getState().project?.path;
+      const next = getState().headers.find((h) => h.dir === dir);
+      if (next) await openChat(next.id);
+      else await newChat();
+    }
+  } catch (e) {
+    toast(e);
+  }
+}
+
+// send sends text in the open chat. One the account cannot run is held,
+// and shows as sent with a sign-in or the plans under it.
+export async function send(text: string): Promise<boolean> {
+  const id = getState().chatId;
+  if (!id) return false;
+  try {
+    if (await api.send(id, text))
+      patchChat(id, (c) => ({
+        ...c,
+        running: true,
+        started: c.started ?? Date.now(),
+      }));
+    return true;
+  } catch (e) {
+    toast(e);
+    return false;
+  }
+}
+
+export function patchChat(id: string, fn: (c: Chat) => Chat): void {
+  setState((s) => (s.chats[id] ? { chats: { ...s.chats, [id]: fn(s.chats[id]) } } : {}));
+}
+
+// Events arrive per token; they are folded in once per frame.
+let queue: ChatEvent[] = [];
+let scheduled = false;
+
+export function listen(): () => void {
+  const stopChat = onChatEvent((e) => {
+    queue.push(e);
+    if (!scheduled) {
+      scheduled = true;
+      requestAnimationFrame(flush);
+    }
+  });
+  const stopAccount = onAccount(setAccount);
+  const stopUpdate = onUpdate((u) => {
+    setState(() => ({ update: u }));
+    if (u.ready) restartIfIdle();
+  });
+  return () => {
+    stopChat();
+    stopAccount();
+    stopUpdate();
+  };
+}
+
+function flush() {
+  scheduled = false;
+  const events = queue;
+  queue = [];
+  let finished = false;
+  setState((s) => {
+    const chats = { ...s.chats };
+    // The model's name for a chat goes in the sidebar as well.
+    const names = new Map<string, string>();
+    for (const e of events) {
+      const c = chats[e.chat];
+      if (!c) continue;
+      chats[e.chat] = fold(c, e);
+      if (e.type === "done") finished = true;
+      if (e.type === "title" && e.title) names.set(e.chat, e.title);
+    }
+    if (!names.size) return { chats };
+    return { chats, headers: s.headers.map((h) => (names.has(h.id) ? { ...h, title: names.get(h.id)! } : h)) };
+  });
+  if (finished) refreshHeaders().catch(() => {});
+}
+
+function fold(c: Chat, e: ChatEvent): Chat {
+  switch (e.type) {
+    case "item": {
+      const it = e.item!;
+      const i = c.items.findIndex((x) => x.id === it.id);
+      const items = i < 0 ? [...c.items, it] : c.items.map((x, j) => (j === i ? it : x));
+      // The rest only come while a turn runs; a held message is not one.
+      const quiet = it.kind === "user" || it.kind === "paywall";
+      return { ...c, items, running: quiet ? c.running : true };
+    }
+    case "delta":
+      return {
+        ...c,
+        items: c.items.map(
+          (x): Item =>
+            x.id === e.id
+              ? {
+                  ...x,
+                  text: (x.text ?? "") + (e.text ?? ""),
+                  reasoning: (x.reasoning ?? "") + (e.reasoning ?? ""),
+                }
+              : x,
+        ),
+      };
+    case "remove":
+      return { ...c, items: c.items.filter((x) => x.id !== e.id) };
+    case "usage":
+      return { ...c, context: e.context ?? c.context };
+    case "start":
+      return {
+        ...c,
+        running: true,
+        started: c.running && c.started ? c.started : Date.now(),
+      };
+    case "title":
+      return { ...c, title: e.title || c.title };
+    case "done": {
+      const last = c.items[c.items.length - 1];
+      const turns = last && e.stats ? [...c.turns, { after: last.id, stats: e.stats }] : c.turns;
+      return {
+        ...c,
+        running: false,
+        started: undefined,
+        title: e.title || c.title,
+        items: c.items.map((x) => (x.streaming ? { ...x, streaming: false } : x)),
+        turns,
+      };
+    }
+  }
+  return c;
+}
